@@ -183,18 +183,60 @@ function simulate(p) {
   };
 }
 
+// ── Robust JSON extractor: handles truncated, markdown-wrapped responses ──
+function extractJSON(raw) {
+  if (!raw) return null;
+  // Strip markdown fences
+  let s = raw.replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/```\s*$/g, "").trim();
+  // Try direct parse first
+  try { return JSON.parse(s); } catch (_) {}
+  // Find outermost { ... }
+  const start = s.indexOf("{");
+  if (start === -1) return null;
+  // Walk forward to find balanced closing brace
+  let depth = 0, end = -1;
+  for (let i = start; i < s.length; i++) {
+    if (s[i] === "{") depth++;
+    else if (s[i] === "}") { depth--; if (depth === 0) { end = i; break; } }
+  }
+  if (end !== -1) {
+    try { return JSON.parse(s.slice(start, end + 1)); } catch (_) {}
+  }
+  // Truncated — attempt to close open structure
+  const partial = end !== -1 ? s.slice(start, end + 1) : s.slice(start);
+  try {
+    // Count unclosed braces/brackets and close them
+    let fixed = partial;
+    let od = 0, od2 = 0;
+    let inStr = false, esc = false;
+    for (const ch of fixed) {
+      if (esc) { esc = false; continue; }
+      if (ch === "\\") { esc = true; continue; }
+      if (ch === '"') { inStr = !inStr; continue; }
+      if (inStr) continue;
+      if (ch === "{") od++;
+      else if (ch === "}") od--;
+      else if (ch === "[") od2++;
+      else if (ch === "]") od2--;
+    }
+    // Remove trailing incomplete key/value (ends mid-string or mid-key)
+    fixed = fixed.replace(/,\s*"[^"]*$/, "").replace(/,\s*$/, "");
+    fixed += "]".repeat(Math.max(0, od2)) + "}".repeat(Math.max(0, od));
+    return JSON.parse(fixed);
+  } catch (_) { return null; }
+}
+
 async function callGemini(apiKey, params, res) {
   const cl = CLIMATE[params.region];
-  const prompt = `You are a precast concrete optimization AI. Return ONLY valid JSON, no markdown, no explanation.
+  // Compact prompt — reduces output size while keeping all structured fields
+  const prompt = `You are a precast concrete AI. Respond ONLY with valid JSON, no markdown fences.
 
-INPUT: Element=${params.element} Mix=${params.mix} fck=${params.fck}MPa Std=${MIX[params.mix].std} Region=${params.region} Temp=${cl.temp}C RH=${cl.rh}% Zone=${cl.zone} Curing=${params.curing} CuringStd=${CURING[params.curing].std} Automation=${params.automation} Moulds=${params.moulds} Qty=${params.quantity}
+Config: element=${params.element} mix=${params.mix} fck=${params.fck}MPa region=${params.region} temp=${cl.temp}C RH=${cl.rh}% curing=${params.curing} automation=${params.automation} moulds=${params.moulds} qty=${params.quantity}
+Results: cycle=${res.cycleHrs}h industryAvg=${res.avgInd}h demould70=${res.demould70}h projDays=${res.projDays} cost=Rs${res.totalCost} vsManual=${res.vsManualCycle}% annualSav=Rs${res.annualSav}L
+Benchmarks: Manual=32h/Rs12400 IndiaAvg=22h/Rs9800 BestInClass=14h/Rs7200
 
-RESULTS: CycleTime=${res.cycleHrs}h IndustryAvg=${res.avgInd}h DemoulT70=${res.demould70}h CyclesPerMould=${res.cyclesPerMould} ProjectDays=${res.projDays} CostPerEl=${res.totalCost} CycleReductionVsManual=${res.vsManualCycle}% AnnualSavings=${res.annualSav}L
-
-BENCHMARKS: Manual=32h/12400 IndiaAvg=22h/9800 BestInClass=14h/7200(PCI-MNL-116)
-
-Return this exact JSON:
-{"verdict":"OPTIMAL|GOOD|SUBOPTIMAL","verdictReason":"1 sentence","protocolAssessment":"2-3 sentences with IS codes","recommendations":[{"rank":1,"action":"specific action","improvement":"X%","detail":"why"},{"rank":2,"action":"specific action","improvement":"X%","detail":"why"},{"rank":3,"action":"specific action","improvement":"X%","detail":"why"}],"risks":[{"risk":"title","severity":"HIGH|MEDIUM|LOW","detail":"description","mitigation":"IS code + action"},{"risk":"title","severity":"HIGH|MEDIUM|LOW","detail":"description","mitigation":"IS code + action"}],"quality":{"strength28day":"XXX-YYY MPa","defectProbability":"X%","complianceStatus":"COMPLIANT|MARGINAL|AT-RISK","complianceNote":"note"},"roi":{"savingPerElement":"Rs X","annualSaving":"Rs X","paybackMonths":N,"summary":"1-2 sentences with rupee figures"}}`;
+Return exactly this JSON structure (keep all string values concise, under 120 chars each):
+{"verdict":"OPTIMAL|GOOD|SUBOPTIMAL","verdictReason":"1 sentence","protocolAssessment":"2 sentences with IS codes","recommendations":[{"rank":1,"action":"action text","improvement":"X%","detail":"reason"},{"rank":2,"action":"action text","improvement":"X%","detail":"reason"},{"rank":3,"action":"action text","improvement":"X%","detail":"reason"}],"risks":[{"risk":"title","severity":"HIGH|MEDIUM|LOW","detail":"description","mitigation":"IS code + action"},{"risk":"title","severity":"HIGH|MEDIUM|LOW","detail":"description","mitigation":"IS code + action"}],"quality":{"strength28day":"XXX-YYY MPa","defectProbability":"X%","complianceStatus":"COMPLIANT|MARGINAL|AT-RISK","complianceNote":"note"},"roi":{"savingPerElement":"Rs X","annualSaving":"Rs X","paybackMonths":N,"summary":"1-2 sentences"}}`;
 
   const r = await fetch(
     `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`,
@@ -203,16 +245,24 @@ Return this exact JSON:
       headers:{"Content-Type":"application/json"},
       body:JSON.stringify({
         contents:[{parts:[{text:prompt}]}],
-        generationConfig:{temperature:0.1, maxOutputTokens:2000},
+        generationConfig:{
+          temperature:0.1,
+          maxOutputTokens:8192,   // ← FIX: was 2000, now 8192 (free tier supports this)
+          responseMimeType:"application/json",  // ← FIX: forces JSON-only response, no markdown fences
+        },
       }),
     }
   );
   if (!r.ok) { const e=await r.json(); throw new Error(e.error?.message||"Gemini API error"); }
   const d = await r.json();
   const raw = d.candidates?.[0]?.content?.parts?.[0]?.text || "";
-  const cleaned = raw.replace(/```json\n?/g,"").replace(/```\n?/g,"").trim();
-  try { return JSON.parse(cleaned); }
-  catch { return { _raw: raw }; }
+
+  // ── FIX: use robust extractor instead of simple replace ──
+  const parsed = extractJSON(raw);
+  if (parsed) return parsed;
+
+  // Last resort: return structured error so UI still renders nicely
+  throw new Error("Could not parse Gemini response. Raw: " + raw.slice(0, 200));
 }
 
 const ChartTip = ({active,payload,label}) => {
@@ -235,7 +285,7 @@ export default function App() {
   const [aiText, setAiText]   = useState(null);
   const [aiLoading, setAiLoad]= useState(false);
   const [aiError, setAiError] = useState("");
-  const [showKey, setShowKey] = useState(false);
+  const [showKeyVisible, setShowKeyVisible] = useState(false); // toggle show/hide password
   const [computing, setComp]  = useState(false);
   const timer = useRef(null);
 
@@ -249,7 +299,7 @@ export default function App() {
   },[p]);
 
   const runAI = async () => {
-    if (!apiKey.trim()) { setShowKey(true); return; }
+    if (!apiKey.trim()) { setAiError("Please enter your Gemini API key above."); return; }
     setAiLoad(true); setAiError(""); setAiText(null);
     try { const t=await callGemini(apiKey,p,res); setAiText(t); setTab("ai"); }
     catch(e) { setAiError(e.message); }
@@ -377,22 +427,40 @@ export default function App() {
             <hr className="dv"/>
             <div className="lbl" style={{marginBottom:10}}>AI Engine · Gemini 2.5 Flash</div>
 
-            {showKey&&(
-              <div style={{marginBottom:10}}>
-                <div className="lbl">API Key</div>
-                <input type="password" placeholder="AIza..." value={apiKey}
-                  onChange={e=>setApiKey(e.target.value)} onKeyDown={e=>e.key==="Enter"&&runAI()}/>
-                <div style={{color:"#1e2a42",fontSize:11,marginTop:5}}>Free at aistudio.google.com</div>
+            <div style={{marginBottom:10}}>
+              <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:6}}>
+                <span className="lbl" style={{marginBottom:0}}>Gemini API Key</span>
+                {apiKey&&(
+                  <span style={{color:"#4ade80",fontSize:10,letterSpacing:".08em"}}>✓ KEY SET</span>
+                )}
               </div>
-            )}
+              <div style={{position:"relative"}}>
+                <input
+                  type={showKeyVisible?"text":"password"}
+                  placeholder="AIza... (free at aistudio.google.com)"
+                  value={apiKey}
+                  onChange={e=>setApiKey(e.target.value)}
+                  onKeyDown={e=>e.key==="Enter"&&runAI()}
+                  style={{paddingRight:38}}
+                />
+                <button
+                  onClick={()=>setShowKeyVisible(v=>!v)}
+                  style={{position:"absolute",right:10,top:"50%",transform:"translateY(-50%)",background:"none",border:"none",color:"#2d3a56",cursor:"pointer",fontSize:13,padding:0,lineHeight:1}}
+                  title={showKeyVisible?"Hide key":"Show key"}
+                >{showKeyVisible?"🙈":"👁"}</button>
+              </div>
+              <div style={{color:"#1e2a42",fontSize:10,marginTop:5,lineHeight:1.5}}>
+                Get a free key at{" "}
+                <span style={{color:"#e2b96f",cursor:"pointer",textDecoration:"underline"}}
+                  onClick={()=>window.open("https://aistudio.google.com/apikey","_blank")}>
+                  aistudio.google.com
+                </span>
+              </div>
+            </div>
+
             <button className="aibtn" onClick={runAI} disabled={aiLoading||!res}>
               {aiLoading?<span><span className="spin">⟳</span> Analysing...</span>:"✦ Run AI Analysis"}
             </button>
-            {!showKey&&(
-              <div style={{color:"#1e2a42",fontSize:11,marginTop:6,textAlign:"center",cursor:"pointer"}} onClick={()=>setShowKey(true)}>
-                {apiKey?"✓ API key set":"Set API key →"}
-              </div>
-            )}
             {aiError&&(
               <div style={{color:"#f87171",fontSize:11,marginTop:8,lineHeight:1.6,background:"#180e0e",padding:"8px 10px",borderRadius:5,border:"1px solid #3a1010"}}>{aiError}</div>
             )}
@@ -915,112 +983,113 @@ export default function App() {
                   </div>
                 )}
 
-                {aiText!=null&&!aiLoading&&(
-                  (() => {
-                    // Handle raw text fallback
-                    if (aiText._raw) {
-                      return (
-                        <div style={{color:"#8896b0",fontSize:13,lineHeight:1.9,whiteSpace:"pre-wrap"}}>
-                          {aiText._raw}
-                        </div>
-                      );
-                    }
-                    const ai = aiText;
-                    const verdictColor = ai.verdict==="OPTIMAL"?"#4ade80":ai.verdict==="GOOD"?"#fbbf24":"#f87171";
-                    const severityColor = s => s==="HIGH"?"#f87171":s==="MEDIUM"?"#fbbf24":"#4ade80";
-                    const compColor = s => s==="COMPLIANT"?"#4ade80":s==="MARGINAL"?"#fbbf24":"#f87171";
+                {aiText!=null&&!aiLoading&&(()=>{
+                  const ai = aiText;
+                  const verdictColor = ai.verdict==="OPTIMAL"?"#4ade80":ai.verdict==="GOOD"?"#fbbf24":"#f87171";
+                  const severityColor = s => s==="HIGH"?"#f87171":s==="MEDIUM"?"#fbbf24":"#4ade80";
+                  const compColor = s => s==="COMPLIANT"?"#4ade80":s==="MARGINAL"?"#fbbf24":"#f87171";
+
+                  // Graceful fallback if verdict is missing (partial parse)
+                  if (!ai.verdict) {
                     return (
-                      <div style={{display:"flex",flexDirection:"column",gap:14}}>
-                        {/* Verdict banner */}
-                        <div style={{background:verdictColor+"12",border:`1px solid ${verdictColor}33`,borderRadius:8,padding:"14px 18px",display:"flex",alignItems:"center",gap:14}}>
-                          <div style={{fontFamily:"'Outfit',sans-serif",fontWeight:900,fontSize:22,color:verdictColor}}>{ai.verdict}</div>
-                          <div style={{color:"#c8d0e0",fontSize:13,lineHeight:1.6}}>{ai.verdictReason}</div>
-                        </div>
-
-                        {/* Protocol Assessment */}
-                        <div style={{background:"#0e1522",border:"1px solid #1e2e48",borderRadius:8,padding:"14px 18px"}}>
-                          <div style={{color:"#60a5fa",fontSize:10,letterSpacing:".14em",marginBottom:8,fontWeight:600}}>PROTOCOL ASSESSMENT</div>
-                          <div style={{color:"#93c5fd",fontSize:13,lineHeight:1.8}}>{ai.protocolAssessment}</div>
-                        </div>
-
-                        {/* Recommendations */}
-                        <div style={{background:"#0c1a0e",border:"1px solid #1a3a1a",borderRadius:8,padding:"14px 18px"}}>
-                          <div style={{color:"#4ade80",fontSize:10,letterSpacing:".14em",marginBottom:12,fontWeight:600}}>CRITICAL RECOMMENDATIONS — RANKED BY IMPACT</div>
-                          <div style={{display:"flex",flexDirection:"column",gap:10}}>
-                            {(ai.recommendations||[]).map((rec,i)=>(
-                              <div key={i} style={{display:"flex",gap:12,alignItems:"flex-start"}}>
-                                <div style={{width:28,height:28,borderRadius:6,background:"#4ade80"+(i===0?"":"33"),display:"flex",alignItems:"center",justifyContent:"center",fontFamily:"'Outfit',sans-serif",fontWeight:900,fontSize:13,color:i===0?"#0e1117":"#4ade80",flexShrink:0}}>#{rec.rank}</div>
-                                <div style={{flex:1}}>
-                                  <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:3}}>
-                                    <span style={{color:"#c8d0e0",fontSize:13,fontWeight:600}}>{rec.action}</span>
-                                    <span style={{background:"#4ade8022",color:"#4ade80",border:"1px solid #4ade8044",borderRadius:20,padding:"1px 8px",fontSize:11,fontWeight:600}}>{rec.improvement}</span>
-                                  </div>
-                                  <div style={{color:"#6b7a99",fontSize:12,lineHeight:1.65}}>{rec.detail}</div>
-                                </div>
-                              </div>
-                            ))}
-                          </div>
-                        </div>
-
-                        {/* Risks + Quality side by side */}
-                        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
-                          <div style={{background:"#1a0e0e",border:"1px solid #3a1010",borderRadius:8,padding:"14px 18px"}}>
-                            <div style={{color:"#f87171",fontSize:10,letterSpacing:".14em",marginBottom:12,fontWeight:600}}>RISK FLAGS</div>
-                            {(ai.risks||[]).map((risk,i)=>(
-                              <div key={i} style={{marginBottom:i<(ai.risks.length-1)?12:0}}>
-                                <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:4}}>
-                                  <span style={{background:severityColor(risk.severity)+"22",color:severityColor(risk.severity),border:`1px solid ${severityColor(risk.severity)}44`,borderRadius:3,padding:"1px 7px",fontSize:10,fontWeight:700}}>{risk.severity}</span>
-                                  <span style={{color:"#fca5a5",fontSize:13,fontWeight:600}}>{risk.risk}</span>
-                                </div>
-                                <div style={{color:"#6b7a99",fontSize:12,lineHeight:1.65,marginBottom:4}}>{risk.detail}</div>
-                                <div style={{color:"#4ade8099",fontSize:11}}>→ {risk.mitigation}</div>
-                              </div>
-                            ))}
-                          </div>
-
-                          <div style={{background:"#0f0f1e",border:"1px solid #2a1f3e",borderRadius:8,padding:"14px 18px"}}>
-                            <div style={{color:"#a78bfa",fontSize:10,letterSpacing:".14em",marginBottom:12,fontWeight:600}}>QUALITY INDICATORS</div>
-                            {ai.quality&&(
-                              <div style={{display:"flex",flexDirection:"column",gap:9}}>
-                                {[
-                                  {label:"28-Day Strength",  val:ai.quality.strength28day,        color:"#c8d0e0"},
-                                  {label:"Defect Probability",val:ai.quality.defectProbability,   color:"#fbbf24"},
-                                  {label:"IS Compliance",    val:ai.quality.complianceStatus,     color:compColor(ai.quality.complianceStatus)},
-                                ].map(({label,val,color})=>(
-                                  <div key={label} style={{display:"flex",justifyContent:"space-between",alignItems:"center",borderBottom:"1px solid #1e2640",paddingBottom:8}}>
-                                    <span style={{color:"#3d4a66",fontSize:12}}>{label}</span>
-                                    <span style={{color,fontSize:13,fontWeight:700,fontFamily:"'Outfit',sans-serif"}}>{val}</span>
-                                  </div>
-                                ))}
-                                <div style={{color:"#6b7a99",fontSize:11,lineHeight:1.65,marginTop:2}}>{ai.quality.complianceNote}</div>
-                              </div>
-                            )}
-                          </div>
-                        </div>
-
-                        {/* ROI */}
-                        {ai.roi&&(
-                          <div style={{background:"#0e1a10",border:"1px solid #1a3a1a",borderRadius:8,padding:"14px 18px"}}>
-                            <div style={{color:"#4ade80",fontSize:10,letterSpacing:".14em",marginBottom:10,fontWeight:600}}>ROI SUMMARY</div>
-                            <div style={{display:"flex",gap:0,marginBottom:10}}>
-                              {[
-                                {label:"Saving / Element",   val:ai.roi.savingPerElement},
-                                {label:"Annual Saving",       val:ai.roi.annualSaving},
-                                {label:"Payback Period",      val:ai.roi.paybackMonths+" months"},
-                              ].map(({label,val},i,arr)=>(
-                                <div key={label} style={{flex:1,padding:"0 16px",borderRight:i<arr.length-1?"1px solid #1a3a1a":"none"}}>
-                                  <div style={{color:"#2d4a2d",fontSize:10,marginBottom:4}}>{label}</div>
-                                  <div style={{color:"#4ade80",fontSize:16,fontWeight:800,fontFamily:"'Outfit',sans-serif"}}>{val}</div>
-                                </div>
-                              ))}
-                            </div>
-                            <div style={{color:"#86efac",fontSize:13,lineHeight:1.7}}>{ai.roi.summary}</div>
-                          </div>
-                        )}
+                      <div style={{background:"#180e0e",border:"1px solid #3a1010",borderRadius:8,padding:"16px 18px"}}>
+                        <div style={{color:"#f87171",fontSize:11,letterSpacing:".1em",marginBottom:8}}>PARTIAL RESPONSE — Could not fully parse AI output</div>
+                        <pre style={{color:"#6b7a99",fontSize:11,whiteSpace:"pre-wrap",wordBreak:"break-all"}}>{JSON.stringify(ai,null,2)}</pre>
                       </div>
                     );
-                  })()
-                )}
+                  }
+
+                  return (
+                    <div style={{display:"flex",flexDirection:"column",gap:14}}>
+                      {/* Verdict banner */}
+                      <div style={{background:verdictColor+"12",border:`1px solid ${verdictColor}33`,borderRadius:8,padding:"14px 18px",display:"flex",alignItems:"center",gap:14}}>
+                        <div style={{fontFamily:"'Outfit',sans-serif",fontWeight:900,fontSize:22,color:verdictColor}}>{ai.verdict}</div>
+                        <div style={{color:"#c8d0e0",fontSize:13,lineHeight:1.6}}>{ai.verdictReason}</div>
+                      </div>
+
+                      {/* Protocol Assessment */}
+                      <div style={{background:"#0e1522",border:"1px solid #1e2e48",borderRadius:8,padding:"14px 18px"}}>
+                        <div style={{color:"#60a5fa",fontSize:10,letterSpacing:".14em",marginBottom:8,fontWeight:600}}>PROTOCOL ASSESSMENT</div>
+                        <div style={{color:"#93c5fd",fontSize:13,lineHeight:1.8}}>{ai.protocolAssessment}</div>
+                      </div>
+
+                      {/* Recommendations */}
+                      <div style={{background:"#0c1a0e",border:"1px solid #1a3a1a",borderRadius:8,padding:"14px 18px"}}>
+                        <div style={{color:"#4ade80",fontSize:10,letterSpacing:".14em",marginBottom:12,fontWeight:600}}>CRITICAL RECOMMENDATIONS — RANKED BY IMPACT</div>
+                        <div style={{display:"flex",flexDirection:"column",gap:10}}>
+                          {(ai.recommendations||[]).map((rec,i)=>(
+                            <div key={i} style={{display:"flex",gap:12,alignItems:"flex-start"}}>
+                              <div style={{width:28,height:28,borderRadius:6,background:"#4ade80"+(i===0?"":"33"),display:"flex",alignItems:"center",justifyContent:"center",fontFamily:"'Outfit',sans-serif",fontWeight:900,fontSize:13,color:i===0?"#0e1117":"#4ade80",flexShrink:0}}>#{rec.rank}</div>
+                              <div style={{flex:1}}>
+                                <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:3}}>
+                                  <span style={{color:"#c8d0e0",fontSize:13,fontWeight:600}}>{rec.action}</span>
+                                  <span style={{background:"#4ade8022",color:"#4ade80",border:"1px solid #4ade8044",borderRadius:20,padding:"1px 8px",fontSize:11,fontWeight:600}}>{rec.improvement}</span>
+                                </div>
+                                <div style={{color:"#6b7a99",fontSize:12,lineHeight:1.65}}>{rec.detail}</div>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+
+                      {/* Risks + Quality side by side */}
+                      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
+                        <div style={{background:"#1a0e0e",border:"1px solid #3a1010",borderRadius:8,padding:"14px 18px"}}>
+                          <div style={{color:"#f87171",fontSize:10,letterSpacing:".14em",marginBottom:12,fontWeight:600}}>RISK FLAGS</div>
+                          {(ai.risks||[]).map((risk,i)=>(
+                            <div key={i} style={{marginBottom:i<(ai.risks.length-1)?12:0}}>
+                              <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:4}}>
+                                <span style={{background:severityColor(risk.severity)+"22",color:severityColor(risk.severity),border:`1px solid ${severityColor(risk.severity)}44`,borderRadius:3,padding:"1px 7px",fontSize:10,fontWeight:700}}>{risk.severity}</span>
+                                <span style={{color:"#fca5a5",fontSize:13,fontWeight:600}}>{risk.risk}</span>
+                              </div>
+                              <div style={{color:"#6b7a99",fontSize:12,lineHeight:1.65,marginBottom:4}}>{risk.detail}</div>
+                              <div style={{color:"#4ade8099",fontSize:11}}>→ {risk.mitigation}</div>
+                            </div>
+                          ))}
+                        </div>
+
+                        <div style={{background:"#0f0f1e",border:"1px solid #2a1f3e",borderRadius:8,padding:"14px 18px"}}>
+                          <div style={{color:"#a78bfa",fontSize:10,letterSpacing:".14em",marginBottom:12,fontWeight:600}}>QUALITY INDICATORS</div>
+                          {ai.quality&&(
+                            <div style={{display:"flex",flexDirection:"column",gap:9}}>
+                              {[
+                                {label:"28-Day Strength",  val:ai.quality.strength28day,        color:"#c8d0e0"},
+                                {label:"Defect Probability",val:ai.quality.defectProbability,   color:"#fbbf24"},
+                                {label:"IS Compliance",    val:ai.quality.complianceStatus,     color:compColor(ai.quality.complianceStatus)},
+                              ].map(({label,val,color})=>(
+                                <div key={label} style={{display:"flex",justifyContent:"space-between",alignItems:"center",borderBottom:"1px solid #1e2640",paddingBottom:8}}>
+                                  <span style={{color:"#3d4a66",fontSize:12}}>{label}</span>
+                                  <span style={{color,fontSize:13,fontWeight:700,fontFamily:"'Outfit',sans-serif"}}>{val}</span>
+                                </div>
+                              ))}
+                              <div style={{color:"#6b7a99",fontSize:11,lineHeight:1.65,marginTop:2}}>{ai.quality.complianceNote}</div>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+
+                      {/* ROI */}
+                      {ai.roi&&(
+                        <div style={{background:"#0e1a10",border:"1px solid #1a3a1a",borderRadius:8,padding:"14px 18px"}}>
+                          <div style={{color:"#4ade80",fontSize:10,letterSpacing:".14em",marginBottom:10,fontWeight:600}}>ROI SUMMARY</div>
+                          <div style={{display:"flex",gap:0,marginBottom:10}}>
+                            {[
+                              {label:"Saving / Element",   val:ai.roi.savingPerElement},
+                              {label:"Annual Saving",       val:ai.roi.annualSaving},
+                              {label:"Payback Period",      val:ai.roi.paybackMonths+" months"},
+                            ].map(({label,val},i,arr)=>(
+                              <div key={label} style={{flex:1,padding:"0 16px",borderRight:i<arr.length-1?"1px solid #1a3a1a":"none"}}>
+                                <div style={{color:"#2d4a2d",fontSize:10,marginBottom:4}}>{label}</div>
+                                <div style={{color:"#4ade80",fontSize:16,fontWeight:800,fontFamily:"'Outfit',sans-serif"}}>{val}</div>
+                              </div>
+                            ))}
+                          </div>
+                          <div style={{color:"#86efac",fontSize:13,lineHeight:1.7}}>{ai.roi.summary}</div>
+                        </div>
+                      )}
+                    </div>
+                  );
+                })()}
 
                 {aiText==null&&!aiLoading&&(
                   <div style={{padding:"40px 0",textAlign:"center"}}>
